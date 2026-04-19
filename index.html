@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visceral Chess - Smooth Turn System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #050505;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            overflow-y: auto;
+            padding: 20px 0;
+        }
+
+        #game-container {
+            position: relative;
+            width: 600px;
+            height: 700px;
+            background: #111;
+            border: 4px solid #331111;
+            box-shadow: 0 0 50px rgba(255, 0, 0, 0.1);
+            overflow: hidden;
+            cursor: crosshair;
+            touch-action: none;
+            margin-bottom: 20px;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .ui-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            pointer-events: none;
+            z-index: 50;
+        }
+
+        .title {
+            color: #880000;
+            font-size: 24px;
+            font-weight: 900;
+            letter-spacing: -1px;
+            font-style: italic;
+            text-shadow: 0 0 10px rgba(255,0,0,0.5);
+        }
+
+        #overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.8);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+    
+    <div class="ui-panel">
+        <div class="title">VISCERAL SLIDE</div>
+        <div id="status" class="text-xs font-bold mt-1">YOUR TURN</div>
+        <div id="turn-count" class="text-[10px] text-zinc-400">TURN: 1</div>
+        <div class="instructions text-[10px] text-zinc-500 mt-1 uppercase">Quick strike! 0.5s Ally Attack</div>
+    </div>
+
+    <div id="overlay">
+        <h2 id="result-text" class="text-4xl font-black text-red-600 mb-6">GAME OVER</h2>
+        <button onclick="resetGame()" class="px-8 py-3 bg-red-900 text-white font-bold hover:bg-red-700 transition-all border border-red-500">REAWAKEN</button>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const turnCountEl = document.getElementById('turn-count');
+    const overlay = document.getElementById('overlay');
+    const resultText = document.getElementById('result-text');
+
+    canvas.width = 600;
+    canvas.height = 700;
+
+    const FRICTION = 0.96;
+    const WALL_BOUNCE = 0.6;
+    const PIECE_RADIUS = 22;
+    const GRID_SIZE = 75;
+    const CHARGE_DURATION = 500; // 攻撃判定の持続時間を0.5秒に変更
+
+    const IMAGES = {
+        p: "https://raw.githubusercontent.com/MasakiKubobo/KuboGames/main/pawn.png",
+        k: "https://raw.githubusercontent.com/MasakiKubobo/KuboGames/main/king.png",
+        q: "https://raw.githubusercontent.com/MasakiKubobo/KuboGames/main/queen.png",
+        b: "https://raw.githubusercontent.com/MasakiKubobo/KuboGames/main/bishop.png",
+        r: "https://raw.githubusercontent.com/MasakiKubobo/KuboGames/main/luke.png",
+        n: "https://raw.githubusercontent.com/MasakiKubobo/KuboGames/main/night.png"
+    };
+
+    const loadedImages = {};
+    Object.entries(IMAGES).forEach(([key, src]) => {
+        const img = new Image();
+        img.src = src;
+        loadedImages[key] = img;
+    });
+
+    let pieces = [];
+    let selectedPiece = null;
+    let mousePos = { x: 0, y: 0 };
+    let isDragging = false;
+    let turn = 'w';
+    let currentTurnNumber = 1;
+    let gameActive = false;
+    let aiThinking = false;
+
+    class Piece {
+        constructor(x, y, type, color) {
+            this.x = x;
+            this.y = y;
+            this.type = type;
+            this.color = color;
+            this.vx = 0;
+            this.vy = 0;
+            this.mass = this.getMass();
+            this.isAlive = true;
+            this.inAir = false;
+            this.airScale = 1;
+            this.hasMoved = false; 
+            this.lastMovedTurn = -10; 
+            this.chargedUntil = 0; 
+        }
+
+        getMass() {
+            const masses = { k: 2.0, q: 1.5, r: 1.8, b: 1.2, n: 1.0, p: 0.8 };
+            return masses[this.type] || 1;
+        }
+
+        update() {
+            if (!this.isAlive) return;
+
+            if (this.inAir) {
+                this.airScale += 0.05;
+                if (this.airScale >= 2.5) {
+                    this.inAir = false;
+                    this.airScale = 1;
+                    checkLandingCollision(this);
+                }
+            }
+
+            this.x += this.vx;
+            this.y += this.vy;
+
+            if (!this.inAir) {
+                this.vx *= FRICTION;
+                this.vy *= FRICTION;
+            }
+
+            if (Math.abs(this.vx) < 0.1) this.vx = 0;
+            if (Math.abs(this.vy) < 0.1) this.vy = 0;
+
+            if (this.x < PIECE_RADIUS) { this.x = PIECE_RADIUS; this.vx *= -WALL_BOUNCE; }
+            if (this.x > canvas.width - PIECE_RADIUS) { this.x = canvas.width - PIECE_RADIUS; this.vx *= -WALL_BOUNCE; }
+            if (this.y < PIECE_RADIUS) { this.y = PIECE_RADIUS; this.vy *= -WALL_BOUNCE; }
+            if (this.y > canvas.height - PIECE_RADIUS) { this.y = canvas.height - PIECE_RADIUS; this.vy *= -WALL_BOUNCE; }
+        }
+
+        draw() {
+            if (!this.isAlive) return;
+            const currentSize = PIECE_RADIUS * 2 * (this.inAir ? this.airScale : 1);
+            const isCharged = Date.now() < this.chargedUntil;
+            
+            ctx.save();
+            const isActive = (currentTurnNumber - this.lastMovedTurn) <= 1;
+            
+            if (this.inAir) {
+                ctx.shadowBlur = 40;
+                ctx.shadowOffsetX = 15;
+                ctx.shadowOffsetY = 20;
+                ctx.shadowColor = 'rgba(255, 255, 255, 0.4)';
+            } else if (isCharged) {
+                ctx.shadowBlur = 25;
+                ctx.shadowColor = '#ffff00'; 
+            } else {
+                ctx.shadowBlur = isActive ? 20 : 10;
+                ctx.shadowColor = this.color === 'w' ? 'rgba(0,100,255,0.5)' : 'rgba(255,0,0,0.5)';
+            }
+            
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, (PIECE_RADIUS - 2) * (this.inAir ? this.airScale : 1), 0, Math.PI * 2);
+            ctx.fillStyle = this.color === 'w' ? '#222' : '#0a0000';
+            
+            let strokeColor = this.color === 'w' ? (isActive ? '#00f2ff' : '#004488') : (isActive ? '#ff3333' : '#880000');
+            if (isCharged) strokeColor = '#ffff00';
+            
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = (isActive || isCharged) ? 4 : 2;
+            ctx.fill();
+            ctx.stroke();
+
+            if (loadedImages[this.type]) {
+                if (this.color === 'b') ctx.filter = 'brightness(0.5) sepia(1) hue-rotate(-50deg) saturate(5)';
+                if (isCharged) ctx.filter = 'brightness(1.5) saturate(2)';
+                ctx.drawImage(loadedImages[this.type], this.x - currentSize/2, this.y - currentSize/2, currentSize, currentSize);
+            }
+            ctx.restore();
+        }
+    }
+
+    function initGame() {
+        pieces = [];
+        gameActive = true;
+        aiThinking = false;
+        overlay.style.display = 'none';
+        turn = 'w';
+        currentTurnNumber = 1;
+        updateUI();
+        
+        for(let i=0; i<8; i++) pieces.push(new Piece(75 + i*65, 550, 'p', 'w'));
+        const wBase = 640;
+        const types = ['r','n','b','q','k','b','n','r'];
+        types.forEach((t, i) => pieces.push(new Piece(75 + i*65, wBase, t, 'w')));
+
+        for(let i=0; i<8; i++) pieces.push(new Piece(75 + i*65, 150, 'p', 'b'));
+        const bBase = 60;
+        types.forEach((t, i) => pieces.push(new Piece(75 + i*65, bBase, t, 'b')));
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    function updateUI() {
+        statusEl.textContent = turn === 'w' ? "YOUR TURN" : "ENEMY'S TURN...";
+        statusEl.style.color = turn === 'w' ? "#00f2ff" : "#ff3333";
+        turnCountEl.textContent = `TURN: ${currentTurnNumber}`;
+    }
+
+    function gameLoop() {
+        if (!gameActive) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        ctx.strokeStyle = '#1a1a1a';
+        for(let i=0; i<canvas.width; i+=GRID_SIZE) { ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,canvas.height); ctx.stroke(); }
+        for(let i=0; i<canvas.height; i+=GRID_SIZE) { ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(canvas.width,i); ctx.stroke(); }
+
+        pieces.forEach(p => p.update());
+        checkCollisions();
+
+        pieces.filter(p => !p.inAir).forEach(p => p.draw());
+        pieces.filter(p => p.inAir).forEach(p => p.draw());
+
+        if (isDragging && selectedPiece) {
+            const validation = validateMove(selectedPiece, mousePos);
+            drawGuideline(selectedPiece, mousePos, validation);
+        }
+
+        if (turn === 'b') handleAI();
+        requestAnimationFrame(gameLoop);
+    }
+
+    function validateMove(p, target, isAI = false) {
+        const dx = target.x - p.x;
+        const dy = target.y - p.y;
+        const angle = Math.atan2(dy, dx);
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        
+        const isVertical = Math.abs(dx) < Math.abs(dy) * 0.5;
+        const isHorizontal = Math.abs(dy) < Math.abs(dx) * 0.5;
+        const isDiagonal = Math.abs(Math.abs(dx) - Math.abs(dy)) < Math.abs(dx) * 0.5;
+
+        let isValid = false;
+        let speedMult = 1;
+
+        switch(p.type) {
+            case 'p':
+                const isForward = (isAI ? dy > 20 : dy < -20) && Math.abs(dx) < Math.abs(dy) * 0.4;
+                const isDiagForward = (isAI ? dy > 20 : dy < -20) && isDiagonal;
+                if (isForward) { isValid = true; speedMult = p.hasMoved ? 1 : 2; }
+                else if (isDiagForward) {
+                    const hasEnemy = pieces.some(other => 
+                        other.isAlive && other.color !== p.color &&
+                        Math.sqrt((other.x - (p.x + dx/dist*50))**2 + (other.y - (p.y + dy/dist*50))**2) < 80
+                    );
+                    if (hasEnemy) { isValid = true; speedMult = 1; }
+                }
+                break;
+            case 'r': if (isVertical || isHorizontal) { isValid = true; speedMult = 3; } break;
+            case 'b': if (isDiagonal) { isValid = true; speedMult = 3; } break;
+            case 'q': if (isVertical || isHorizontal || isDiagonal) { isValid = true; speedMult = 3; } break;
+            case 'k': isValid = true; speedMult = 1; break;
+            case 'n': isValid = true; speedMult = 1; break; 
+        }
+        return { isValid, angle, dist, speedMult };
+    }
+
+    function drawGuideline(p, target, val) {
+        ctx.save();
+        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(target.x, target.y);
+        if (val.isValid) {
+            ctx.strokeStyle = '#00f2ff'; ctx.lineWidth = 3; ctx.shadowBlur = 15; ctx.shadowColor = '#00f2ff';
+        } else {
+            ctx.strokeStyle = 'rgba(255, 0, 0, 0.2)'; ctx.lineWidth = 1;
+        }
+        ctx.setLineDash([5, 5]); ctx.stroke(); ctx.restore();
+    }
+
+    function checkCollisions() {
+        for (let i = 0; i < pieces.length; i++) {
+            for (let j = i + 1; j < pieces.length; j++) {
+                const p1 = pieces[i]; const p2 = pieces[j];
+                if (!p1.isAlive || !p2.isAlive || p1.inAir || p2.inAir) continue;
+
+                const dx = p2.x - p1.x;
+                const dy = p2.y - p1.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist < PIECE_RADIUS * 2) {
+                    const angle = Math.atan2(dy, dx);
+                    const sin = Math.sin(angle); const cos = Math.cos(angle);
+                    const vx1 = p1.vx * cos + p1.vy * sin;
+                    const vy1 = p1.vy * cos - p1.vx * sin;
+                    const vx2 = p2.vx * cos + p2.vy * sin;
+                    const vy2 = p2.vy * cos - p2.vx * sin;
+
+                    const v1final = ((p1.mass - p2.mass) * vx1 + 2 * p2.mass * vx2) / (p1.mass + p2.mass);
+                    const v2final = ((p2.mass - p1.mass) * vx2 + 2 * p1.mass * vx1) / (p1.mass + p2.mass);
+
+                    p1.vx = v1final * cos - vy1 * sin; p1.vy = vy1 * cos + v1final * sin;
+                    p2.vx = v2final * cos - vy2 * sin; p2.vy = vy2 * cos + v2final * sin;
+
+                    const overlap = PIECE_RADIUS * 2 - dist;
+                    p1.x -= (overlap / 2) * cos; p1.y -= (overlap / 2) * sin;
+                    p2.x += (overlap / 2) * cos; p2.y += (overlap / 2) * sin;
+
+                    const now = Date.now();
+                    const p1Charged = now < p1.chargedUntil;
+                    const p2Charged = now < p2.chargedUntil;
+
+                    if (p1.color !== p2.color) {
+                        const p1Active = ((currentTurnNumber - p1.lastMovedTurn) <= 1) || p1Charged;
+                        const p2Active = ((currentTurnNumber - p2.lastMovedTurn) <= 1) || p2Charged;
+
+                        if (p1Active && !p2Active) killPiece(p2);
+                        else if (p2Active && !p1Active) killPiece(p1);
+                    } else {
+                        const p1Moving = Math.sqrt(p1.vx**2 + p1.vy**2) > 2;
+                        const p2Moving = Math.sqrt(p2.vx**2 + p2.vy**2) > 2;
+                        
+                        if (p1Moving || p1Charged) p2.chargedUntil = now + CHARGE_DURATION;
+                        if (p2Moving || p2Charged) p1.chargedUntil = now + CHARGE_DURATION;
+                    }
+                }
+            }
+        }
+    }
+
+    function checkLandingCollision(knight) {
+        pieces.forEach(p => {
+            if (p === knight || !p.isAlive) return;
+            const dist = Math.sqrt((p.x - knight.x)**2 + (p.y - knight.y)**2);
+            if (dist < PIECE_RADIUS * 2.5) {
+                if (p.color !== knight.color) {
+                    killPiece(p);
+                } else {
+                    const angle = Math.atan2(p.y - knight.y, p.x - knight.x);
+                    p.vx = Math.cos(angle) * 10;
+                    p.vy = Math.sin(angle) * 10;
+                    p.chargedUntil = Date.now() + CHARGE_DURATION;
+                }
+            }
+        });
+        knight.vx *= 1.2; 
+        knight.vy *= 1.2;
+    }
+
+    function killPiece(p) {
+        p.isAlive = false;
+        if (p.type === 'k') endGame(p.color === 'w' ? 'DEFEAT' : 'VICTORY');
+    }
+
+    function endGame(msg) {
+        gameActive = false;
+        overlay.style.display = 'flex';
+        resultText.textContent = msg;
+    }
+
+    function resetGame() { initGame(); }
+
+    canvas.addEventListener('mousedown', (e) => {
+        if (turn !== 'w') return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        selectedPiece = pieces.find(p => p.isAlive && p.color === 'w' && Math.sqrt((p.x-mx)**2+(p.y-my)**2) < PIECE_RADIUS);
+        if (selectedPiece) isDragging = true;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        mousePos.x = e.clientX - rect.left;
+        mousePos.y = e.clientY - rect.top;
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (isDragging && selectedPiece) {
+            const val = validateMove(selectedPiece, mousePos);
+            if (val.isValid) {
+                applyLaunch(selectedPiece, val.angle, Math.min(val.dist / 10, 8) * val.speedMult);
+                turn = 'b';
+                currentTurnNumber++;
+                updateUI();
+            }
+            isDragging = false;
+            selectedPiece = null;
+        }
+    });
+
+    function applyLaunch(p, angle, power) {
+        if (p.type === 'n') {
+            const knightPower = 6.3; // 0.7倍
+            p.vx = Math.cos(angle) * knightPower;
+            p.vy = Math.sin(angle) * knightPower;
+            p.inAir = true;
+            p.airScale = 1;
+        } else {
+            p.vx = Math.cos(angle) * power;
+            p.vy = Math.sin(angle) * power;
+        }
+        p.hasMoved = true;
+        p.lastMovedTurn = currentTurnNumber;
+    }
+
+    function handleAI() {
+        if (aiThinking) return;
+        aiThinking = true;
+
+        setTimeout(() => {
+            if (!gameActive) return;
+            const aiPieces = pieces.filter(p => p.isAlive && p.color === 'b');
+            if (aiPieces.length === 0) { aiThinking = false; return; }
+
+            const playerKing = pieces.find(tp => tp.isAlive && tp.color === 'w' && tp.type === 'k');
+            
+            let bestMove = null;
+            let attempts = 0;
+
+            while (!bestMove && attempts < 25) {
+                const p = aiPieces[Math.floor(Math.random() * aiPieces.length)];
+                const target = playerKing || pieces.find(tp => tp.isAlive && tp.color === 'w');
+                
+                if (target) {
+                    const angle = Math.atan2(target.y - p.y, target.x - p.x);
+                    const dist = 100;
+                    const val = validateMove(p, { x: p.x + Math.cos(angle) * dist, y: p.y + Math.sin(angle) * dist }, true);
+                    
+                    if (val.isValid) {
+                        bestMove = { p, angle, power: 6 + Math.random() * 8 };
+                    }
+                }
+                attempts++;
+            }
+
+            if (!bestMove) {
+                const p = aiPieces[Math.floor(Math.random() * aiPieces.length)];
+                const angle = Math.PI / 2 + (Math.random() - 0.5);
+                bestMove = { p, angle, power: 6 };
+            }
+
+            applyLaunch(bestMove.p, bestMove.angle, bestMove.power);
+
+            turn = 'w';
+            currentTurnNumber++;
+            updateUI();
+            aiThinking = false;
+        }, 800);
+    }
+
+    window.onload = initGame;
+</script>
+
+</body>
+</html>
